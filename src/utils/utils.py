@@ -9,7 +9,7 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_core.documents import Document
 from flask import jsonify,url_for
 from src.database.models import Image,ImageAnalysis
-
+from src.utils.ollama_client import analyze_image_with_ollama
 def ensure_folder_record(root_path: str):
     folder = Folder.query.filter_by(root_path=root_path).first()
     if folder:
@@ -258,3 +258,80 @@ def search_in_embeddings(user_search, embedding_model="nomic-embed-text", base_u
     except Exception as e:
         print(f"⚠️ Error en search_in_embeddings: {e}")
         raise
+
+
+def run_classification_thread(app, pending_images, folder_id, model, retry_non_json):
+    """
+    Procesa las imágenes en background dentro del contexto Flask.
+    """
+    with app.app_context():  # 🔥 Activa el contexto de Flask aquí
+        print(f"🚀 Clasificación iniciada en background ({len(pending_images)} imágenes)")
+
+        base_prompt = (
+            "Describe brevemente la imagen en español y devuelve SOLO JSON con:\n"
+            "{\n"
+            '  \"description\": str,\n'
+            '  \"category\": str,\n'
+            '  \"subcategory\": str|null,\n'
+            '  \"tags\": [str]\n'
+            "}\n"
+            "No incluyas texto fuera del JSON. Sé conciso."
+        )
+
+        analyzed, errors = [], []
+
+        for img in pending_images:
+            try:
+                result = analyze_image_with_ollama(
+                    image_path=img.abs_path,
+                    model=model,
+                    prompt=base_prompt,
+                    retry_non_json=retry_non_json
+                )
+
+                if "error" in result:
+                    img.status = "error"
+                    img.updated_at = datetime.utcnow()
+                    errors.append({"image_id": img.id, "error": result["error"]})
+                    continue
+
+                desc = result.get("description", "").strip()
+                cat = (result.get("category") or "Sin clasificar").strip().title()
+                sub = result.get("subcategory") or None
+                tags = result.get("tags") or []
+
+                index_embedding(
+                    image_id=img.id,
+                    description=desc,
+                    category=cat,
+                    embedding_model="nomic-embed-text"
+                )
+
+                analysis = ImageAnalysis.query.filter_by(image_id=img.id).first()
+                if not analysis:
+                    analysis = ImageAnalysis(
+                        image_id=img.id,
+                        description=desc,
+                        category=cat,
+                        subcategory=sub,
+                        tags=tags,
+                        analyzed_at=datetime.utcnow(),
+                    )
+                    db.session.add(analysis)
+                else:
+                    analysis.description = desc
+                    analysis.category = cat
+                    analysis.subcategory = sub
+                    analysis.tags = tags
+                    analysis.analyzed_at = datetime.utcnow()
+
+                img.status = "indexed"
+                img.updated_at = datetime.utcnow()
+                analyzed.append(img.id)
+
+            except Exception as e:
+                print(f"⚠️ Error procesando {img.id}: {e}")
+                errors.append({"image_id": img.id, "error": str(e)})
+
+        db.session.commit()
+        print(f"✅ Clasificación completada — {len(analyzed)} procesadas, {len(errors)} con error.")
