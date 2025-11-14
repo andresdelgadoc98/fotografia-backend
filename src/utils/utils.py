@@ -8,11 +8,10 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_core.documents import Document
 from flask import jsonify,url_for
-from src.database.models import Image,ImageAnalysis
-from src.utils.ollama_client import analyze_image_with_ollama
+from src.database.models import Image,ImageAnalysis,Category
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
-
+from src.utils.ollama_client import analyze_image_with_ollama
+from sqlalchemy import func
 def ensure_folder_record(root_path: str):
     folder = Folder.query.filter_by(root_path=root_path).first()
     if folder:
@@ -196,75 +195,121 @@ def index_embedding(image_id, description, category,embedding_model):
     except Exception as e:
         print(f"⚠️ Error al indexar imagen {image_id}: {e}")
 
-def search_in_embeddings(user_search, embedding_model="nomic-embed-text", base_url="http://192.168.0.21:11434", k=10):
-    """
-    Realiza una búsqueda semántica en el índice FAISS de descripciones de imágenes
-    y devuelve los resultados con el mismo formato que list_photos().
-    """
+def search_in_embeddings(
+    user_search,
+    start_date=None,
+    end_date=None,
+    category=None,
+    limit=50,
+    page=1,
+    embedding_model="nomic-embed-text",
+    base_url="http://192.168.0.21:11434",
+    k=50,   # aumentamos FAISS para tener margen para filtrar
+):
     try:
         # --- Validación ---
-        if not user_search or not user_search.strip():
-            raise ValueError("El parámetro 'user_search' está vacío.")
+        if not user_search.strip():
+            raise ValueError("Texto vacío en user_search")
 
         db_path = "db/photos_descriptions"
         if not os.path.exists(db_path):
-            raise FileNotFoundError(f"No existe el índice FAISS en {db_path}")
+            raise FileNotFoundError(f"No existe índice FAISS en {db_path}")
 
-        # --- Crear cliente de embeddings ---
+        # --- Embeddings client ---
         embedding = OllamaEmbeddings(
             model=embedding_model,
             base_url=base_url
         )
 
-        # --- Cargar índice FAISS ---
+        # --- Load FAISS ---
         vector_store = FAISS.load_local(
             db_path,
             embedding,
             allow_dangerous_deserialization=True
         )
 
-        # --- Buscar similitud ---
+        # --- FAISS similarity search ---
         retriever = vector_store.as_retriever(search_kwargs={"k": k})
         results = retriever.invoke(user_search)
 
-        # --- Obtener IDs de imagen ---
-        image_ids = [r.metadata.get("id") for r in results if r.metadata.get("id")]
+        image_ids_ranked = [r.metadata.get("id") for r in results if r.metadata.get("id")]
 
-        if not image_ids:
-            print("⚠️ Sin resultados FAISS.")
-            return jsonify([])
+        if not image_ids_ranked:
+            return jsonify({"results": [], "total": 0})
 
-        # --- Consultar base de datos ---
-        images = (
+        # --- SQL query base ---
+        query = (
             Image.query
-            .filter(Image.id.in_(image_ids))
-            .join(ImageAnalysis)
-            .all()
+            .join(Image.analysis)
+            .filter(Image.id.in_(image_ids_ranked))
         )
 
-        # --- Formato frontend (igual que list_photos) ---
-        photos = []
-        for img in images:
-            analysis = img.analysis
-            if not analysis:
-                continue
-            photos.append({
+
+        # --- Filtro categoría ---
+        if category:
+            clean = category.strip().lower()
+            query = query.join(ImageAnalysis.category_rel).filter(
+                func.lower(Category.name) == clean
+            )
+
+        # --- Filtro fechas ---
+        if start_date:
+            try:
+                dt_start = datetime.fromisoformat(start_date)
+                query = query.filter(ImageAnalysis.analyzed_at >= dt_start)
+            except:
+                pass
+
+        if end_date:
+            try:
+                dt_end = datetime.fromisoformat(end_date)
+                query = query.filter(ImageAnalysis.analyzed_at <= dt_end)
+            except:
+                pass
+
+        # --- Obtener resultados filtrados ---
+        images = query.all()
+
+        # --- Mantener orden por FAISS ---
+        images_sorted = sorted(images, key=lambda img: image_ids_ranked.index(img.id))
+
+        # --- Paginación ---
+        start_i = (page - 1) * limit
+        end_i = start_i + limit
+
+        page_items = images_sorted[start_i:end_i]
+        total = len(images_sorted)
+
+        # --- Serializar ---
+        output = []
+        for img in page_items:
+            ia = img.analysis
+            output.append({
                 "id": img.id,
-                "category": analysis.category or "Sin categoría",
-                "tags": ", ".join(analysis.tags) if isinstance(analysis.tags, list) else str(analysis.tags or ""),
+                "abs_path": img.abs_path,
+                "description": ia.description if ia else None,
+                "category": ia.category_rel.name if ia and ia.category_rel else None,
+                "subcategory": ia.subcategory if ia else None,
+                "tags": ia.tags if ia else None,
+                "analyzed_at": ia.analyzed_at.isoformat() if ia and ia.analyzed_at else None,
                 "img": url_for("documents.view_image", image_id=img.id, _external=True)
             })
 
-        print(f"✅ {len(photos)} resultados encontrados.")
-        return jsonify(photos)
+        return jsonify({
+            "results": output,
+            "total": total,
+            "page": page,
+            "limit": limit,
+        })
 
     except Exception as e:
         print(f"⚠️ Error en search_in_embeddings: {e}")
         raise
 
+
 def process_single_image(img, model, base_prompt, retry_non_json):
     """Procesa una sola imagen y devuelve resultado resumido."""
-    t0 = time.perf_counter()
+
     try:
         result = analyze_image_with_ollama(
             image_path=img.abs_path,
@@ -274,7 +319,7 @@ def process_single_image(img, model, base_prompt, retry_non_json):
         )
 
         if "error" in result:
-            return {"id": img.id, "status": "error", "error": result["error"], "time": time.perf_counter() - t0}
+            return {"id": img.id, "status": "error", "error": result["error"]}
 
         desc = result.get("description", "").strip()
         cat = (result.get("category") or "Sin clasificar").strip().title()
@@ -291,13 +336,28 @@ def process_single_image(img, model, base_prompt, retry_non_json):
             "category": cat,
             "subcategory": sub,
             "tags": tags,
-            "time": time.perf_counter() - t0
+
         }
 
     except Exception as e:
-        return {"id": img.id, "status": "error", "error": str(e), "time": time.perf_counter() - t0}
+        return {"id": img.id, "status": "error", "error": str(e)}
 
 
+def get_or_create_category(name):
+    if not name:
+        return None
+
+    clean = name.strip().lower()
+
+    cat = Category.query.filter(func.lower(Category.name) == clean).first()
+    if cat:
+        return cat.id
+
+
+    cat = Category(name=clean)
+    db.session.add(cat)
+    db.session.commit()
+    return cat.id
 
 def run_classification_thread(app, pending_images, folder_id, model, retry_non_json):
     with app.app_context():
@@ -328,22 +388,23 @@ def run_classification_thread(app, pending_images, folder_id, model, retry_non_j
                 result = future.result()
 
                 if result["status"] == "ok":
-                    # 🔥 Recargar correctamente desde BD
                     img = Image.query.get(result["id"])
                     if not img:
-                        print(f"⚠️ No se encontró la imagen {result['id']} en la BD.")
                         continue
 
                     img.status = "indexed"
                     img.updated_at = datetime.utcnow()
 
-                    # Obtener o crear análisis
+                    # NUEVO -> normalizar categoría
+                    cat_id = get_or_create_category(result["category"])
+
                     analysis = ImageAnalysis.query.filter_by(image_id=img.id).first()
+
                     if not analysis:
                         analysis = ImageAnalysis(
                             image_id=img.id,
                             description=result["desc"],
-                            category=result["category"],
+                            category_id=cat_id,
                             subcategory=result["subcategory"],
                             tags=result["tags"],
                             analyzed_at=datetime.utcnow(),
@@ -351,21 +412,86 @@ def run_classification_thread(app, pending_images, folder_id, model, retry_non_j
                         db.session.add(analysis)
                     else:
                         analysis.description = result["desc"]
-                        analysis.category = result["category"]
+                        analysis.category_id = cat_id
                         analysis.subcategory = result["subcategory"]
                         analysis.tags = result["tags"]
                         analysis.analyzed_at = datetime.utcnow()
 
-                    # 🔥 Guardar cambios inmediatamente
                     db.session.commit()
-                    print(f"✅ Imagen {img.id} — {result['category']} ({result['time']:.2f}s)")
-
-                else:
-                    print(f"⚠️ Imagen {result['id']} — Error ({result['error']})")
-
-            folder = Folder.query.get(folder_id)
-            if folder:
-                folder.status = "done"
-                db.session.commit()
 
             print(f"🏁 Clasificación terminada para folder {folder_id}")
+
+def search_with_filters(start_date, end_date, category, limit=50, page=1):
+    from sqlalchemy import func
+    query = Image.query.join(Image.analysis)
+
+    if start_date:
+        query = query.filter(ImageAnalysis.analyzed_at >= start_date)
+
+    if end_date:
+        query = query.filter(ImageAnalysis.analyzed_at <= end_date)
+
+    if category:
+        clean = category.strip().lower()
+        query = query.join(ImageAnalysis.category_rel).filter(
+            func.lower(Category.name) == clean
+        )
+
+    total = query.count()
+
+    images = (
+        query
+        .order_by(Image.id.asc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all()
+    )
+
+    results = []
+    for img in images:
+        ia = img.analysis
+        results.append({
+            "id": img.id,
+            "img": url_for("documents.view_image", image_id=img.id, _external=True),
+            "category": ia.category_rel.name if ia and ia.category_rel else None,
+            "description": ia.description if ia else None,
+            "tags": ia.tags if ia else None,
+        })
+
+    return jsonify({
+        "results": results,
+        "total": total,
+        "page": page,
+        "limit": limit
+    })
+
+
+def list_all_photos(limit=50, page=1):
+    query = Image.query.join(Image.analysis)
+    total = query.count()
+
+    images = (
+        query
+        .order_by(Image.id.asc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all()
+    )
+
+    results = []
+    for img in images:
+        ia = img.analysis
+        results.append({
+            "id": img.id,
+            "img": url_for("documents.view_image", image_id=img.id, _external=True),
+            "category": ia.category_rel.name if ia and ia.category_rel else None,
+            "description": ia.description if ia else None,
+            "tags": ia.tags if ia else None,
+        })
+
+    return jsonify({
+        "results": results,
+        "total": total,
+        "page": page,
+        "limit": limit
+    })
