@@ -6,11 +6,11 @@ CREATE TABLE IF NOT EXISTS image_analysis (
     tags JSON,
     analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS folders (
     id SERIAL PRIMARY KEY,
     root_path TEXT UNIQUE NOT NULL,
-    created_at TIMESTAMP NOT NULL
+    created_at TIMESTAMP NOT NULL,
+    status VARCHAR(20) DEFAULT 'idle'
 );
 
 CREATE TABLE IF NOT EXISTS images (
@@ -23,4 +23,9 @@ CREATE TABLE IF NOT EXISTS images (
     status TEXT,
     created_at TIMESTAMP,
     updated_at TIMESTAMP
+);
+
+CREATE TABLE categories (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
 );

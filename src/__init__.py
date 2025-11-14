@@ -27,8 +27,10 @@ def create_app():
     db.init_app(app)
 
     # --- Registro de blueprints ---
-    from .routes import photos
+    from .routes import photos,folder,category
     app.register_blueprint(photos.main, url_prefix='/api/photos')
+    app.register_blueprint(folder.main, url_prefix='/api/folder')
+    app.register_blueprint(category.main, url_prefix='/api/categories')
 
 
     return app

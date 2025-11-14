@@ -6,100 +6,13 @@ from src.database.models import Image,ImageAnalysis
 import threading
 
 app = Flask(__name__)
-base_url = "http://192.168.0.22:5001"
+base_url = "http://192.168.0.21:5001"
 main = Blueprint('documents', __name__)
 
 DB_PATH = "photo_index.db"
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".heic"}
 
 
-@main.route('scan', methods=['POST'])
-def scan_folder():
-    data = request.get_json(silent=True) or {}
-    path = data.get("path")
-    compute_hash = bool(data.get("compute_hash", False))
-    allowed_exts = data.get("allowed_exts", [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".heic"])
-    allowed_exts = [ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in allowed_exts]
-
-    if not path:
-        return jsonify({"error": "Falta el campo 'path'"}), 400
-
-    base_path = Path(path)
-    if not base_path.exists() or not base_path.is_dir():
-        return jsonify({"error": "Ruta no válida o no es un directorio"}), 400
-
-    if not os.access(base_path, os.R_OK):
-        return jsonify({"error": "Sin permisos de lectura en la carpeta"}), 400
-
-    root_path = str(base_path.resolve())
-
-
-    folder_id, existing_images = get_or_create_folder_with_images(root_path)
-
-    found_files = []
-
-    for f in base_path.rglob("*"):
-        if not f.is_file():
-            continue
-        if f.suffix.lower() not in allowed_exts:
-            continue
-
-        try:
-            stat = f.stat()
-            file_info = {
-                "abs_path": str(f.resolve()),
-                "rel_path": str(f.relative_to(base_path)),
-                "size_bytes": stat.st_size,
-                "mtime": int(stat.st_mtime)
-            }
-            found_files.append(file_info)
-        except Exception as e:
-            print(f"[WARN] No se pudo leer {f}: {e}")
-            continue
-
-        # --- Paso 5: Detección de diferencias ---
-        existing_paths = set(existing_images.keys())
-        found_paths = {f["abs_path"] for f in found_files}
-
-        inserted, updated, unchanged, deleted = 0, 0, 0, 0
-
-
-    for file_info in found_files:
-        abs_path = file_info["abs_path"]
-        size_bytes = file_info["size_bytes"]
-        mtime = file_info["mtime"]
-
-        if abs_path not in existing_images:
-            inserted += 1
-
-        else:
-            old = existing_images[abs_path]
-            if size_bytes != old["size"] or mtime != old["mtime"]:
-                updated += 1
-
-            else:
-                unchanged += 1
-
-    for old_path in existing_paths - found_paths:
-        deleted += 1
-
-
-    to_insert, to_update, to_mark_deleted, stats = partition_diffs(found_files, existing_images)
-
-
-    ins_n = bulk_insert_images(folder_id, to_insert)
-    upd_n = bulk_update_images( to_update)
-    del_n = mark_deleted(folder_id, to_mark_deleted)
-
-    stats = {"inserted": ins_n, "updated": upd_n, "deleted": del_n}
-
-    return jsonify({
-        "path": root_path,
-        "folder_id": folder_id,
-        "found_count": len(found_files),
-        "existing_count": len(existing_images),
-        "stats": stats
-    })
 from flask import current_app
 
 @main.route("/classify", methods=["POST"])
@@ -200,10 +113,7 @@ def list_photos():
 
 @main.route('/search_images', methods=['POST'])
 def search_images():
-    """
-    Búsqueda semántica entre las descripciones de imágenes.
-    Usa FAISS local generado en db/photos_descriptions
-    """
+
     try:
         data = request.json
         user_search = data.get('user_search', '').strip()

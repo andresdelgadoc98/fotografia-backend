@@ -5,11 +5,13 @@ from src import db
 class Folder(db.Model):
     __tablename__ = "folders"
 
+
     id = db.Column(db.Integer, primary_key=True)
     root_path = db.Column(db.Text, unique=True, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-    # Relación 1:N con imágenes
+    status = db.Column(db.String(20), default="idle")
+
     images = db.relationship("Image", back_populates="folder")
 
 
@@ -35,10 +37,26 @@ class ImageAnalysis(db.Model):
     __tablename__ = "image_analysis"
 
     image_id = db.Column(db.Integer, db.ForeignKey("images.id"), primary_key=True)
+
     description = db.Column(db.Text)
-    category = db.Column(db.String(100))
+
+    # 🔥 NUEVO: categoría normalizada
+    category_id = db.Column(db.Integer, db.ForeignKey("categories.id"))
+
     subcategory = db.Column(db.String(100))
     tags = db.Column(db.JSON)
     analyzed_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    # relaciones
     image = db.relationship("Image", back_populates="analysis")
+    category_rel = db.relationship("Category", back_populates="analyses")
+
+
+class Category(db.Model):
+    __tablename__ = "categories"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+
+    # relación 1:N con image_analysis
+    analyses = db.relationship("ImageAnalysis", back_populates="category_rel")

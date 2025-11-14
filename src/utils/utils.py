@@ -10,6 +10,9 @@ from langchain_core.documents import Document
 from flask import jsonify,url_for
 from src.database.models import Image,ImageAnalysis
 from src.utils.ollama_client import analyze_image_with_ollama
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+
 def ensure_folder_record(root_path: str):
     folder = Folder.query.filter_by(root_path=root_path).first()
     if folder:
@@ -259,13 +262,50 @@ def search_in_embeddings(user_search, embedding_model="nomic-embed-text", base_u
         print(f"⚠️ Error en search_in_embeddings: {e}")
         raise
 
+def process_single_image(img, model, base_prompt, retry_non_json):
+    """Procesa una sola imagen y devuelve resultado resumido."""
+    t0 = time.perf_counter()
+    try:
+        result = analyze_image_with_ollama(
+            image_path=img.abs_path,
+            model=model,
+            prompt=base_prompt,
+            retry_non_json=retry_non_json
+        )
+
+        if "error" in result:
+            return {"id": img.id, "status": "error", "error": result["error"], "time": time.perf_counter() - t0}
+
+        desc = result.get("description", "").strip()
+        cat = (result.get("category") or "Sin clasificar").strip().title()
+        sub = result.get("subcategory") or None
+        tags = result.get("tags") or []
+
+        index_embedding(img.id, desc, cat, embedding_model="nomic-embed-text")
+
+        # Devolver resultado limpio
+        return {
+            "id": img.id,
+            "status": "ok",
+            "desc": desc,
+            "category": cat,
+            "subcategory": sub,
+            "tags": tags,
+            "time": time.perf_counter() - t0
+        }
+
+    except Exception as e:
+        return {"id": img.id, "status": "error", "error": str(e), "time": time.perf_counter() - t0}
+
+
 
 def run_classification_thread(app, pending_images, folder_id, model, retry_non_json):
-    """
-    Procesa las imágenes en background dentro del contexto Flask.
-    """
-    with app.app_context():  # 🔥 Activa el contexto de Flask aquí
-        print(f"🚀 Clasificación iniciada en background ({len(pending_images)} imágenes)")
+    with app.app_context():
+        print(f"🚀 Clasificación en background — {len(pending_images)} imágenes (4 hilos)")
+        folder = Folder.query.get(folder_id)
+        if folder:
+            folder.status = "processing"
+            db.session.commit()
 
         base_prompt = (
             "Describe brevemente la imagen en español y devuelve SOLO JSON con:\n"
@@ -278,60 +318,54 @@ def run_classification_thread(app, pending_images, folder_id, model, retry_non_j
             "No incluyas texto fuera del JSON. Sé conciso."
         )
 
-        analyzed, errors = [], []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(process_single_image, img, model, base_prompt, retry_non_json)
+                for img in pending_images
+            ]
 
-        for img in pending_images:
-            try:
-                result = analyze_image_with_ollama(
-                    image_path=img.abs_path,
-                    model=model,
-                    prompt=base_prompt,
-                    retry_non_json=retry_non_json
-                )
+            for future in as_completed(futures):
+                result = future.result()
 
-                if "error" in result:
-                    img.status = "error"
+                if result["status"] == "ok":
+                    # 🔥 Recargar correctamente desde BD
+                    img = Image.query.get(result["id"])
+                    if not img:
+                        print(f"⚠️ No se encontró la imagen {result['id']} en la BD.")
+                        continue
+
+                    img.status = "indexed"
                     img.updated_at = datetime.utcnow()
-                    errors.append({"image_id": img.id, "error": result["error"]})
-                    continue
 
-                desc = result.get("description", "").strip()
-                cat = (result.get("category") or "Sin clasificar").strip().title()
-                sub = result.get("subcategory") or None
-                tags = result.get("tags") or []
+                    # Obtener o crear análisis
+                    analysis = ImageAnalysis.query.filter_by(image_id=img.id).first()
+                    if not analysis:
+                        analysis = ImageAnalysis(
+                            image_id=img.id,
+                            description=result["desc"],
+                            category=result["category"],
+                            subcategory=result["subcategory"],
+                            tags=result["tags"],
+                            analyzed_at=datetime.utcnow(),
+                        )
+                        db.session.add(analysis)
+                    else:
+                        analysis.description = result["desc"]
+                        analysis.category = result["category"]
+                        analysis.subcategory = result["subcategory"]
+                        analysis.tags = result["tags"]
+                        analysis.analyzed_at = datetime.utcnow()
 
-                index_embedding(
-                    image_id=img.id,
-                    description=desc,
-                    category=cat,
-                    embedding_model="nomic-embed-text"
-                )
+                    # 🔥 Guardar cambios inmediatamente
+                    db.session.commit()
+                    print(f"✅ Imagen {img.id} — {result['category']} ({result['time']:.2f}s)")
 
-                analysis = ImageAnalysis.query.filter_by(image_id=img.id).first()
-                if not analysis:
-                    analysis = ImageAnalysis(
-                        image_id=img.id,
-                        description=desc,
-                        category=cat,
-                        subcategory=sub,
-                        tags=tags,
-                        analyzed_at=datetime.utcnow(),
-                    )
-                    db.session.add(analysis)
                 else:
-                    analysis.description = desc
-                    analysis.category = cat
-                    analysis.subcategory = sub
-                    analysis.tags = tags
-                    analysis.analyzed_at = datetime.utcnow()
+                    print(f"⚠️ Imagen {result['id']} — Error ({result['error']})")
 
-                img.status = "indexed"
-                img.updated_at = datetime.utcnow()
-                analyzed.append(img.id)
+            folder = Folder.query.get(folder_id)
+            if folder:
+                folder.status = "done"
+                db.session.commit()
 
-            except Exception as e:
-                print(f"⚠️ Error procesando {img.id}: {e}")
-                errors.append({"image_id": img.id, "error": str(e)})
-
-        db.session.commit()
-        print(f"✅ Clasificación completada — {len(analyzed)} procesadas, {len(errors)} con error.")
+            print(f"🏁 Clasificación terminada para folder {folder_id}")
